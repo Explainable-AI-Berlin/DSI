@@ -1,0 +1,7 @@
+BootStrap: docker
+From: rocm/pytorch:rocm7.2_ubuntu24.04_py3.12_pytorch_release_2.7.1
+
+%post
+python -m pip install "transformer_lens==2.17.0" "transformers==4.57.6"
+python -m pip install git+https://github.com/Explainable-AI-Berlin/LRPforTL.git@c7023dd699be79023cb8012c0463e5a71c5b7cda
+python -m pip install "scikit-learn==1.8.0"
