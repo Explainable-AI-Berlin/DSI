@@ -4,7 +4,7 @@
   <img src="assets/overview.svg" alt="Overview of the Distributed Sparse Interventions method" width="100%">
 </p>
 
-This repository contains code for the preprint "Distributed Sparse Interventions in Language Models" (LINK ARXIV).
+This repository contains code for the preprint [Distributed Sparse Interventions in Language Models](https://arxiv.org/abs/2607.07128).
 
 ## Setting up the environment
 You can use the "DSI.def" file to build a singularity container that has all necessary packages installed. It builds on top of a container provided by AMD that already has pytorch installed (from https://hub.docker.com/r/rocm/pytorch), if you use an NVIDIA graphs card, you have to switch the base container respectively (https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch).
