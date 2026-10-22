@@ -4,6 +4,7 @@ import torch
 import random
 import math
 import os
+from pathlib import Path
 import lrp_for_tl
 from tqdm import tqdm
 import numpy as np
@@ -43,6 +44,9 @@ def get_cache(model, tokens, hook_names, out_indices_true, backward = True):
 
 def true_logits(logits, out_indices_true):
     return logits[:, -1, :].gather(1, out_indices_true.unsqueeze(1)).sum()
+
+def true_log_probs(logits, out_indices_true):
+    return logits[:, -1, :].log_softmax(dim=-1).gather(1, out_indices_true.unsqueeze(1)).sum()
 
 def run_attributions(
         model, hook_names, data, n_samples, batch_size, n_shots, backward = True):
@@ -207,29 +211,15 @@ def write_taskwise(df, results_dir, taskwise_sub, model_short, task):
     df.to_csv(os.path.join(d, "_".join([model_short, task]) + ".csv"), index=False)
 
 def combine_taskwise(model_name, tasks):
-    """Merge per-(model, task) shards into the per-model CSVs that figures.R reads."""
+    """Merge per-(model, task) shards into the per-model CSVs that figures.R reads:
+    results/<dir>/taskwise<tag>/<model>_<task>.csv -> results/<dir>/<model><tag>.csv"""
     m = model_name.split("/")[-1]
-    jobs = [
-        ("results/baseline",  "taskwise",            ""),
-        ("results/iterative", "taskwise",            ""),
-        ("results/iterative", "taskwise_summary",    "_summary"),
-        ("results/test",      "taskwise_robust",     "_robust"),
-        ("results/test",      "taskwise_not_robust", "_not_robust"),
-        ("results/hyperpars", "taskwise_robust",     "_robust"),
-        ("results/hyperpars", "taskwise_not_robust", "_not_robust"),
-    ]
-    for results_dir, taskwise_sub, suffix in jobs:
-        src = os.path.join(results_dir, taskwise_sub)
-        if not os.path.isdir(src):
-            continue
-        parts = [
-            pd.read_csv(os.path.join(src, "_".join([m, t]) + ".csv"))
-            for t in tasks
-            if os.path.exists(os.path.join(src, "_".join([m, t]) + ".csv"))
-        ]
-        if parts:
-            pd.concat(parts).to_csv(
-                os.path.join(results_dir, m + suffix + ".csv"), index=False)
+    for d in ("baseline", "iterative", "test", "hyperpars"):
+        for src in sorted(Path("results", d).glob("taskwise*")):
+            parts = [pd.read_csv(f) for t in tasks if (f := src / f"{m}_{t}.csv").exists()]
+            if parts:
+                pd.concat(parts).to_csv(
+                    src.parent / f"{m}{src.name[len('taskwise'):]}.csv", index=False)
 
 def load_attributions(
         model_name, task, grad_type,

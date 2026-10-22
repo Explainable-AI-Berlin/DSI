@@ -17,7 +17,7 @@ stitch_minmax <- function(val, low, up){
   val = formatC(val, format = "f", digits = 2)
   low = formatC(low, format = "f", digits = 2)
   up = formatC(up, format = "f", digits = 2)
-  out = str_c(val, " {\\scriptsize", low, "-", up, "}")
+  out = str_c(val, " {\\tiny", low, "-", up, "}")
   return(out)
 }
 
@@ -50,9 +50,13 @@ models <- c("Qwen3-8B", "gemma-3-4b-it", "Llama-3.2-3B-Instruct")
 model_names <- c(
   "Llama-3.2-3B-Instruct" ~ "Llama 3.2 (3B)",
   "gemma-3-4b-it" ~ "Gemma 3 (4B)",
-  "Qwen3-8B" ~ "Qwen 3 (8B)")
+  "Qwen3-8B" ~ "Qwen 3 (8B)"
+)
 
-sizes <- c(8, 16, 32, 64, 128, 256, 512, 1024, 2048)
+sizes <- c(1, 2, 4, 8, 16, 32, 64, 128, 256)
+loss_suffix <- "_log_likelihood"
+
+fig_file <- function(name) here("figures", str_c(name, loss_suffix, ".pdf"))
 
 load_results <- function(dir, models, suffix = ""){
   results <- 
@@ -76,18 +80,25 @@ load_results <- function(dir, models, suffix = ""){
 baseline <- load_results("baseline", models)
 no_iterative <- load_results("test", models, "_robust")
 not_robust <- load_results("test", models, "_not_robust")
-iterative <- load_results("iterative", models)
+iterative <- load_results("iterative", models, loss_suffix)
+single_layer <- load_results("iterative", models, str_c("_single_layer", loss_suffix))
 
 iterative$method = "DSI"
 no_iterative$method = "no refinement"
 not_robust$method = "no refinement &\nno gradient robustification"
+single_layer$method = "DSI 1-layer"
 
 res_combined <- bind_rows(iterative, no_iterative, not_robust)
+res_combined_sl <- bind_rows(res_combined, single_layer)
+
+fv_long <- read_csv("results_fv/results.csv") %>% 
+  mutate(task = factor(task, level = task_order))
 
 # Figure 3 + Appendix E
-plot_accuracies <- function(results, baseline, m, name, save){
-  results <- results %>% filter(model == m)
+plot_accuracies <- function(results, baseline, fv, m, name, save){
+  results <- results %>% filter(model == m, size %in% sizes)
   baseline <- baseline %>% filter(model == m)
+  fv <- fv %>% filter(model == m, method == "bl_fv_zs")
   p <- results %>% 
     ggplot(aes(x = size, y = accuracy, color = method)) +
     geom_line() +
@@ -114,15 +125,34 @@ plot_accuracies <- function(results, baseline, m, name, save){
       aes(yintercept = majority_accuracy, linetype = "majority class baseline"),
       alpha = .5
     ) + 
+    geom_hline(
+      data = fv,
+      aes(yintercept = accuracy, color = "FV best layer"),
+      alpha = .5
+      ) +
     scale_color_manual(
-      values = c( "black", "#ce9642", "#3b7c70", "#A72608", "#898e9f", "#A72608", "black","#898e9f"),
+      values = c(
+        "DSI" = "black",
+        "FV best layer" = "#2274A5",
+        "DSI direct" = "#A72608",
+        "no refinement" = "#ce9642",
+        "no refinement &\nno gradient robustification" = "#3b7c70"),
       breaks=c(
-        'DSI', 'no refinement', 'no refinement &\nno gradient robustification',
-        '0-shot baseline', '10-shot baseline', 'majority class baseline')
+        'DSI', 'DSI direct', 'no refinement',
+        'no refinement &\nno gradient robustification', "FV best layer")
     ) +
     scale_fill_manual(
-      values = c("black", "#ce9642", "#3b7c70", "#ce9642", "black", "#A72608","#2274A5"),
-      breaks=c('DSI', 'no refinement', 'no refinement &\nno gradient robustification')) +
+      values = c(
+        "DSI" = "black",
+        "DSI direct" = "#A72608",
+        "no refinement" = "#ce9642",
+        "no refinement &\nno gradient robustification" = "#3b7c70"),
+      breaks=c(
+        'DSI', 'DSI direct', 'no refinement',
+        'no refinement &\nno gradient robustification')) +
+    scale_linetype_manual(
+      values = c(1,2,6)
+    ) +
     theme_minimal(base_size = 11) +
     theme(
       panel.grid.major = element_blank(),
@@ -137,7 +167,7 @@ plot_accuracies <- function(results, baseline, m, name, save){
     guides(fill = "none", colour = guide_legend(order = 1), linetype = guide_legend(order=2))
   if(save){
     ggsave(
-      here("figures", paste0(name, "_", m, ".pdf")),
+      fig_file(paste0(name, "_", m)),
       plot = p,
       width = 10,
       height = 4)
@@ -145,13 +175,49 @@ plot_accuracies <- function(results, baseline, m, name, save){
   return(p)
 }
 
-plot_accuracies(res_combined, baseline, models[1], "acc_task", TRUE)
-plot_accuracies(res_combined, baseline, models[2], "acc_task", TRUE)
-plot_accuracies(res_combined, baseline, models[3], "acc_task", TRUE)
+plot_accuracies(res_combined, baseline, fv_long, models[1], "acc_task", TRUE)
+plot_accuracies(res_combined, baseline, fv_long, models[2], "acc_task", TRUE)
+plot_accuracies(res_combined, baseline, fv_long, models[3], "acc_task", TRUE)
 
-# Table 1
+# distributed -------------------------------------------------------------
+
+res_combined_sl %>% 
+  filter(method %in% c("DSI", "DSI 1-layer"), size %in% sizes) %>% 
+  select(!c(size_check, ci_lower, ci_upper, n_samples, scale, nsamples)) %>% 
+  pivot_wider(values_from = accuracy, names_from = method) %>% 
+  mutate(
+    accuracy_diff = DSI - `DSI 1-layer`,
+    model = case_match(model, !!!model_names)) %>% 
+  group_by(size, model) %>% 
+  summarise(accuracy_diff = mean(accuracy_diff)) %>% 
+  ggplot(aes(x = size, y = accuracy_diff, color = model)) +
+  geom_line() +
+  scale_x_log10(breaks=sizes) +
+  scale_y_continuous(breaks = seq(0, 1, 0.1), limits = c(0, 0.3)) +
+  scale_color_manual(
+    values = c(
+      "Qwen 3 (8B)" ="black", "Gemma 3 (4B)" = "#ce9642", "Llama 3.2 (3B)" = "#3b7c70"),
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1, size = 10),
+    axis.title.x = element_text(size = 15, vjust = 0),
+    axis.title.y = element_text(size = 15),
+    legend.title=element_text(size=13), 
+    legend.text=element_text(size=11)) +
+  labs(colour = "Model", x = "# Neurons", y = "Avg. Accuracy \n Difference")
+
+ggsave(here("figures", "single_layer.pdf"), width = 6, height = 2.5)
+
+# Table 1 -----------------------------------------------------------------
 res_summary <- res_combined %>% 
-  filter(size %in% c(8, 16, 32, 64)) %>% 
+  group_by(model) %>%
+  mutate(size = ifelse(size == max(size), "$d$ model", size)) %>% 
+  filter(size %in% c(64, "$d$ model")) %>% 
+  ungroup() %>% 
   mutate(task_set = ifelse(task %in% abstractive, "abstractive", "extractive")) %>% 
   select(model, method, task_set, accuracy, size) %>% 
   group_by(model, method, size, task_set) %>% 
@@ -183,7 +249,7 @@ bl_summary <- baseline %>%
     mean_acc = mean(accuracy),
     min_acc = min(accuracy),
     max_acc = max(accuracy)) %>% 
-  mutate(accuracy = stitch_ci(mean_acc, min_acc, max_acc)) %>% 
+  mutate(accuracy = stitch_minmax(mean_acc, min_acc, max_acc)) %>% 
   select(model, task_set, accuracy) %>% 
   mutate(
     model = case_match(
@@ -191,15 +257,55 @@ bl_summary <- baseline %>%
       !!!model_names)
     ) %>%
   pivot_wider(names_from = "model", values_from = "accuracy") %>% 
-  mutate(size = "/", method = "Baseline")
+  mutate(size = "$0$", method = "Baseline")
 
-main_table <- bind_rows(res_summary, bl_summary)
+fv_summary <- fv_long %>% 
+  mutate(
+    model = case_match(
+      model,
+      !!!model_names)) %>% 
+  group_by(model, method, task_set, size) %>% 
+  summarise(
+    mean_acc = mean(accuracy),
+    min_acc = min(accuracy),
+    max_acc = max(accuracy)) %>%
+  mutate(accuracy = stitch_minmax(mean_acc, min_acc, max_acc)) %>% 
+  select(model, task_set, method, size, accuracy) %>% 
+  mutate(
+    method = case_match(
+      method,
+      "zs_fv" ~ "FV",
+      "bl_fv_zs" ~ "FV best l."
+    )) %>%
+  pivot_wider(names_from = "model", values_from = "accuracy") %>% 
+  mutate(size = "$d$ model")
 
+main_table <- bind_rows(res_summary, bl_summary, fv_summary)
+
+options(knitr.kable.NA = '')
 main_table %>% 
   pivot_wider(names_from = task_set, values_from = c(`Llama 3.2 (3B)`, `Qwen 3 (8B)`, `Gemma 3 (4B)`)) %>% 
-  mutate(size = factor(size, levels = c("/", "8", "16", "32", "64"))) %>% 
+  mutate(
+    size = factor(size, levels = c("$0$", "64", "$d$ model")),
+    method = case_match(
+      method,
+      "DSI" ~ "DSI",
+      "no refinement" ~ "no iter.",
+      "not robust" ~ "no rob.",
+      "FV best l." ~ "FV best",
+      "FV" ~ "FV",
+      "Baseline" ~ "baseline"),
+    method = factor(method, levels = c("baseline", "FV", "FV best", "no rob.", "no iter.", "DSI")),
+    sc = ifelse(method %in% c("baseline", "FV best", "FV"), "bm", "im")) %>% 
+  ungroup() %>% 
+  arrange(sc, size, method) %>% 
   select(size, method, contains("abstractive"), contains("extractive")) %>% 
-  arrange(size, desc(method)) %>% 
+  rename_with(
+    ~str_remove(., "_abstractive")) %>% 
+  rename_with(
+    ~str_remove(., "\\(\\d+B\\)")) %>% 
+  rename_with(
+    ~str_replace(., "_extractive", " ")) %>% 
   knitr::kable(
     format = "latex",
     booktabs = T,
@@ -208,7 +314,6 @@ main_table %>%
     align = "r",
   ) %>% 
   add_header_above(c(" " = 2, "abstractive" = 3, "extractive" = 3))
-
 
 # neuron effects (Fig. 2) -------------------------------------------------
 
@@ -251,14 +356,14 @@ ggsave(here("figures", "neuron_pair_effects.pdf"), width = 7.5, height = 2.2)
 
 # neuron positions (Appendix G) -------------------------------------------
 
-neurons_per_head <- load_results("/figures/neurons_per_head", models)
+neurons_per_head <- load_results("/figures/neurons_per_head", models, loss_suffix)
 neurons_per_head <- mutate(
   neurons_per_head,
   head = head+1,
   layer = layer+1)
 
 neurons_per_head %>% 
-  filter(n_neurons != 0, method == "iterative") %>% 
+  filter(n_neurons != 0, method == "iterative", size %in% sizes) %>% 
   mutate(
     model = case_match(
       model,
@@ -281,14 +386,14 @@ neurons_per_head %>%
     legend.position = "top") +
   labs(color = "")
 
-ggsave(here("figures", "components.pdf"), width = 5, height = 4)
+ggsave(fig_file("components"), width = 5, height = 4)
 
 neurons_per_head %>% 
   filter(n_neurons != 0, size == 64, model == models[1], method == "iterative") %>%
   ggplot() +
   geom_tile(aes(y = head, x = layer, fill = n_neurons)) +
   theme_minimal(base_size = 14) +
-  scale_fill_viridis_c(breaks = c(1, 16)) +
+  scale_fill_viridis_c(breaks = c(1, 19)) +
   scale_y_continuous(breaks = c(1, 8, 16, 24, 32), limits = c(0, 33)) +
   scale_x_continuous(breaks = c(1, 9, 18, 27, 36), limits = c(0, 37)) +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
@@ -299,14 +404,14 @@ neurons_per_head %>%
   facet_wrap(~task) +
   labs(x = "Layer", y = "Head", fill = "# Neurons")
 
-ggsave(here("figures", "Qwen3_neuron_layers_heads_bytask.pdf"), width = 10, height = 6)
+ggsave(fig_file("Qwen3_neuron_layers_heads_bytask"), width = 10, height = 6)
 
 neurons_per_head %>% 
   filter(n_neurons != 0, size == 64, model == models[2], method == "iterative") %>%
   ggplot() +
   geom_tile(aes(y = head, x = layer, fill = n_neurons)) +
   theme_minimal(base_size = 14) +
-  scale_fill_viridis_c(breaks = c(1, 8)) +
+  scale_fill_viridis_c(breaks = c(1, 21)) +
   scale_y_continuous(breaks = c(1, 8), limits = c(0, 9)) +
   scale_x_continuous(breaks = c(1, 17, 34), limits = c(0, 35)) +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
@@ -317,14 +422,14 @@ neurons_per_head %>%
   facet_wrap(~task) +
   labs(x = "Layer", y = "Head", fill = "# Neurons")
 
-ggsave(here("figures", "gemma3_neuron_layers_heads_bytask.pdf"), width = 10, height = 6)
+ggsave(fig_file("gemma3_neuron_layers_heads_bytask"), width = 10, height = 6)
 
 neurons_per_head %>% 
   filter(n_neurons != 0, size == 64, model == models[3], method == "iterative") %>%
   ggplot() +
   geom_tile(aes(y = head, x = layer, fill = n_neurons)) +
   theme_minimal(base_size = 14) +
-  scale_fill_viridis_c(breaks = c(1, 11)) +
+  scale_fill_viridis_c(breaks = c(1, 16)) +
   scale_y_continuous(breaks = c(1, 8, 16, 24), limits = c(0, 25)) +
   scale_x_continuous(breaks = c(1, 14, 28), limits = c(0, 29)) +
   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
@@ -335,14 +440,15 @@ neurons_per_head %>%
   facet_wrap(~task) +
   labs(x = "Layer", y = "Head", fill = "# Neurons")
 
-ggsave(here("figures", "llama32_neuron_layers_heads_bytask.pdf"), width = 10, height = 6)
+ggsave(fig_file("llama32_neuron_layers_heads_bytask"), width = 10, height = 6)
 
 
 # Iterative result details (Appendix F) -----------------------------------
 
-iterative_summary <- load_results("iterative", models, "_summary")
+iterative_summary <- load_results("iterative", models, str_c("_summary", loss_suffix))
 
 iterative_summary %>% 
+  filter(size %in% sizes) %>% 
   mutate(
     mask_overlap = mask_overlap/size,
     task = factor(task, levels = task_order),
@@ -370,11 +476,20 @@ iterative_summary %>%
   labs(colour = "", x = "# Neurons", y = "Neuron set overlap") +
   guides(fill = "none")
 
-ggsave(here("figures", "mask_overlap.pdf"), width = 10, height = 4)
+ggsave(fig_file("mask_overlap"), width = 10, height = 4)
 
-intervention_strength <- load_results("/figures/intervention_strength", models)
+intervention_strength <- load_results("/figures/intervention_strength", models, loss_suffix)
+
+fv_norms <- read_csv("results_fv/norms.csv") %>% 
+  mutate(
+    model = case_match(
+      model,
+      !!!model_names
+    )
+  )
 
 intervention_strength %>% 
+  filter(size %in% sizes) %>% 
   mutate(
     task = factor(task, levels = task_order),
     model = case_match(
@@ -388,6 +503,7 @@ intervention_strength %>%
     )) %>% 
   ggplot(aes(x = size, y = total_abs, color = method)) +
   geom_line()+
+  geom_hline(data = fv_norms, aes(yintercept = l1_norm, color = "function vector"), linetype = 8) +
   theme_minimal() +
   theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
   theme(axis.text.y = element_text(size = 10),
@@ -399,9 +515,10 @@ intervention_strength %>%
   facet_wrap(model ~ task) +
   scale_x_log10(breaks=sizes) +
   scale_y_continuous(trans = "log10") + # breaks = seq(0, 1, 0.2), limits = c(0, 1)) +
-  scale_color_manual(values = c("#898e9f","#3b7c70", "#ce9642", "#898e9f","#2274A5", "#A72608","black", "orange", "green")) +
+  scale_color_manual(values = c("#898e9f","black","#3b7c70", "#ce9642", "#898e9f","#2274A5", "#A72608","black", "orange", "green")) +
   scale_fill_manual(values = c("#898e9f","#2274A5", "#A72608", "black", "#2274A5")) +
   labs(colour = "", x = "# Neurons", y = "Total absolute intervention") +
   guides(fill = "none")
 
-ggsave(here("figures", "total_intervention.pdf"), width = 10, height = 15)
+ggsave(fig_file("total_intervention"), width = 10, height = 15)
+

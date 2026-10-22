@@ -15,7 +15,7 @@
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=110000
 
-#SBATCH --time=7:00:00
+#SBATCH --time=8:00:00
 
 #SBATCH --array=0-35
 
@@ -23,7 +23,7 @@ module purge
 module load apptainer
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-export HF_TOKEN=$(cat ~/.hf_token)
+export HF_TOKEN=$(cat ./.hf_token)
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
 MODELS=(Qwen/Qwen3-8B google/gemma-3-4b-it meta-llama/Llama-3.2-3B-Instruct)
@@ -40,4 +40,5 @@ srun \
     python main_results/experiments.py \
     --model-names $MODEL \
     --tasks $TASK \
+    --add-resid-dim \
     --steps baseline attributions compute_iterative eval_iterative no_robustification no_refinement

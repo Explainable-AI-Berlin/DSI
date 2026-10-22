@@ -1,8 +1,13 @@
 import torch
-from utils.general import true_logits, forward_batched
+from utils.general import true_logits, true_log_probs, forward_batched
 
 ############################################################################################
 # iterative
+
+value_functions = {
+    "logit": true_logits,
+    "log_likelihood": true_log_probs,
+}
 
 def prox_l0_ball(y: torch.Tensor, n_nonzero: int):
     """Project onto the L0 ball: keep the n_nonzero largest-magnitude entries."""
@@ -11,8 +16,8 @@ def prox_l0_ball(y: torch.Tensor, n_nonzero: int):
     xbar.flatten()[top_idx] = y.flatten()[top_idx]
     return xbar, 0.0
 
-def scale_value(s, act_diff, model, hook_names, batches, n_samples):
-    """Compute the negative true output logits depending on the scaling factor s."""
+def scale_value(s, act_diff, model, hook_names, batches, n_samples, value_fn=true_logits):
+    """Compute the negative objective (true output logits or log-probs) depending on the scaling factor s."""
     # compute interventions
     intervention = s * act_diff
     intervention_dict = {hook_names[l]: intervention[l] for l in range(model.cfg.n_layers)}
@@ -28,15 +33,15 @@ def scale_value(s, act_diff, model, hook_names, batches, n_samples):
     # foward passes over all batches
     total_value = torch.tensor(0.0, device=torch.device('cuda'))
     for tokens, out_indices_true in batches:
-        value = true_logits(forward_batched(model, tokens), out_indices_true)
+        value = value_fn(forward_batched(model, tokens), out_indices_true)
         total_value -= value
     total_value = total_value / n_samples
     # cleanup
     model.reset_hooks()
     return total_value.item()
 
-def scale_grad(s, act_diff, model, hook_names, batches, n_samples):
-    """Compute the gradient of the negative true output logits w.r.t. the scaling factor s."""
+def scale_grad(s, act_diff, model, hook_names, batches, n_samples, value_fn=true_logits):
+    """Compute the gradient of the negative objective w.r.t. the scaling factor s."""
     # reset gradients of s
     s = s.detach().requires_grad_(True)
     # compute interventions
@@ -54,7 +59,7 @@ def scale_grad(s, act_diff, model, hook_names, batches, n_samples):
     # foward passes over all batches
     total_value = torch.tensor(0.0, device=torch.device('cuda'))
     for tokens, out_indices_true in batches:
-        value = true_logits(forward_batched(model, tokens), out_indices_true)
+        value = value_fn(forward_batched(model, tokens), out_indices_true)
         total_value -= value
     total_value = total_value / n_samples
     # gradient computation

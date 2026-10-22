@@ -4,6 +4,7 @@ import torch
 import random
 from steps import eval_baseline, compute_attributions, compute_iterative, eval_iterative, \
     eval_first_order, run_intervention_effects, prepare_figures
+from transformer_lens.loading_from_pretrained import get_pretrained_model_config
 from numpy import logspace, linspace, concatenate
 
 torch.backends.cudnn.benchmark = False
@@ -67,6 +68,17 @@ if __name__ == "__main__":
     parser.add_argument("--tol", type=float, default=1e-8)
     parser.add_argument("--n-restarts", type=int, default=10)
     parser.add_argument("--noise-scale", type=float, default=0.3)
+    parser.add_argument(
+        "--loss", type=str, default="log_likelihood", choices=["logit", "log_likelihood"])
+    parser.add_argument(
+        "--single-layer", action="store_true",
+        help="restrict intervention to a single layer at 1/3 model depth")
+    parser.add_argument(
+        "--no-overshoot", action="store_true",
+        help="disable ZeroFPR's initial 1.5*gamma prox-gradient pre-step")
+    parser.add_argument(
+        "--add-resid-dim", action="store_true",
+        help="append the model's residual stream dimension (d_model) to the sizes")
 
     args = parser.parse_args()
     steps = args.steps
@@ -82,7 +94,7 @@ if __name__ == "__main__":
     backward_batch_size = args.backward_batch_size
 
     if sizes is None:
-        sizes = [int(s) for s in logspace(3, 11, num=9, base=2)]
+        sizes = [int(s) for s in logspace(0, 8, num=9, base=2)]
     if scales is None:
         scales = concatenate([linspace(0.01, 1, 10), linspace(2, 10, 9), linspace(11, 50, 30)])
 
@@ -91,6 +103,11 @@ if __name__ == "__main__":
         torch.cuda.empty_cache()
 
     for model_name in args.model_names:
+        sizes_model = sizes
+        if args.add_resid_dim:
+            d_model = get_pretrained_model_config(model_name).d_model
+            if d_model not in sizes_model:
+                sizes_model = sizes_model + [d_model]
         if "baseline" in steps:
             eval_baseline(
                 model_name,
@@ -119,7 +136,7 @@ if __name__ == "__main__":
             compute_iterative(
                 model_name,
                 tasks,
-                sizes,
+                sizes_model,
                 n_train,
                 backward_batch_size,
                 args.max_iterations,
@@ -128,6 +145,9 @@ if __name__ == "__main__":
                 random_seed,
                 n_restarts=args.n_restarts,
                 noise_scale=args.noise_scale,
+                loss=args.loss,
+                single_layer=args.single_layer,
+                overshoot=not args.no_overshoot,
                 )
             flush()
         if "eval_iterative" in steps:
@@ -136,10 +156,13 @@ if __name__ == "__main__":
                 tasks,
                 n_test,
                 forward_batch_size_0_shot,
-                sizes,
+                sizes_model,
                 args.alpha,
                 torch_seed,
-                random_seed)
+                random_seed,
+                loss=args.loss,
+                single_layer=args.single_layer,
+                overshoot=not args.no_overshoot)
             flush()
         if "no_robustification" in steps:
             compute_attributions(
@@ -160,7 +183,7 @@ if __name__ == "__main__":
                 n_train,
                 n_test,
                 forward_batch_size_0_shot,
-                sizes,
+                sizes_model,
                 scales,
                 args.alpha,
                 torch_seed,
@@ -174,7 +197,7 @@ if __name__ == "__main__":
                 n_train,
                 n_test,
                 forward_batch_size_0_shot,
-                sizes,
+                sizes_model,
                 scales,
                 args.alpha,
                 torch_seed,
@@ -182,6 +205,6 @@ if __name__ == "__main__":
                 robust=True)
             flush()
         if "prepare_figures" in steps:
-            prepare_figures(model_name, tasks, sizes)
+            prepare_figures(model_name, tasks, sizes_model, loss=args.loss)
     if "intervention_effects" in steps:
         run_intervention_effects(torch_seed, random_seed)

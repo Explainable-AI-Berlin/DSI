@@ -21,7 +21,7 @@ module purge
 module load apptainer
 
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK}
-export HF_TOKEN=$(cat ~/.hf_token)
+export HF_TOKEN=$(cat ./.hf_token)
 export PYTHONPATH=$(pwd):$PYTHONPATH
 
 srun \
