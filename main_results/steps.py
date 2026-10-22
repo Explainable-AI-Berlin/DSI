@@ -9,7 +9,7 @@ from utils.general import no_space_tokens, load_task_split, forward_batched, \
     first_token_withspace, evaluate_accuracy, load_model, load_attributions, \
     intervention_effect, topk_mask_bool, n_shot_indices, generate_batch, intervention_fwd, \
     wilson_ci, eval_hyperpars, run_attributions, write_taskwise, combine_taskwise
-from utils.iterative import prox_l0_ball, scale_grad, scale_value
+from utils.iterative import prox_l0_ball, scale_grad, scale_value, value_functions
 from ZeroFPR import ZeroFPR
 from numpy import linspace
 
@@ -148,10 +148,18 @@ def compute_iterative(
         random_seed,
         n_restarts=10,
         noise_scale=0.3,
+        loss="logit",
+        single_layer=False,
+        overshoot=True,
         ):
-    
+
     os.makedirs("iterative/interventions", exist_ok=True)
     os.makedirs("iterative/trace", exist_ok=True)
+
+    # file name tags
+    value_fn = value_functions[loss]
+    loss_tag = [] if loss == "logit" else [loss]
+    layer_tag = ["single_layer"] if single_layer else []
 
     ############################################################################################
     # load model
@@ -159,12 +167,18 @@ def compute_iterative(
     model, hook_names = load_model(model_name)
     model.requires_grad_(False)
 
+    layer_idx = model.cfg.n_layers // 3 if single_layer else None
+    if single_layer:
+        layer_dim = model.cfg.n_heads * model.cfg.d_head
+        sizes = [s for s in sizes if s < layer_dim]
+
     for task in tasks:
 
         torch.manual_seed(torch_seed)
         random.seed(random_seed)
 
         summary_rows = []
+        restart_rows = []
 
         data = no_space_tokens(model, load_task_split(task, "train"))
         n_samples_task = min(n_samples, len(data))
@@ -173,6 +187,11 @@ def compute_iterative(
 
         attributions = load_attributions(model.cfg.model_name, task, "robust")
         act_diff, effect = intervention_effect(attributions)
+        if single_layer:
+            layer_mask = torch.zeros_like(effect, dtype=torch.bool)
+            layer_mask[layer_idx] = True
+            # keep the relevance-based warm start inside the layer
+            effect = effect.masked_fill(~layer_mask, float("-inf"))
 
         n_batches = math.ceil(n_samples_task / batch_size)
         batches = []
@@ -182,17 +201,22 @@ def compute_iterative(
             batches.append((tokens, out_indices_true))
 
         for n_neurons in sizes:
-
+            # reseed per set size so results don't depend on sizes run order
+            torch.manual_seed(torch_seed)
             # penalty function
-            l0 = lambda y, gamma, k=n_neurons: prox_l0_ball(y, k)
+            if single_layer:
+                assert n_neurons <= layer_mask.sum().item()
+                l0 = lambda y, gamma, k=n_neurons: prox_l0_ball(y * layer_mask, k)
+            else:
+                l0 = lambda y, gamma, k=n_neurons: prox_l0_ball(y, k)
             # inital values
             mask = topk_mask_bool(n_neurons, effect)
             s_0 = torch.zeros_like(act_diff)
             s_0[mask] = 1.0
 
             # objective function
-            f = lambda s: scale_value(s, act_diff, model, hook_names, batches, n_samples_task)
-            f_and_grad = lambda s: scale_grad(s, act_diff, model, hook_names, batches, n_samples_task)
+            f = lambda s: scale_value(s, act_diff, model, hook_names, batches, n_samples_task, value_fn)
+            f_and_grad = lambda s: scale_grad(s, act_diff, model, hook_names, batches, n_samples_task, value_fn)
             initial_value, _ = f_and_grad(s_0)
 
             best_s, best_trace, best_final_value = None, None, float("-inf")
@@ -202,6 +226,8 @@ def compute_iterative(
                     x0 = s_0.clone()
                 else:
                     x0 = noise_scale * torch.randn_like(s_0)
+                    if single_layer:
+                        x0 = x0 * layer_mask
 
                 s, trace_r = ZeroFPR(
                     x0=x0,
@@ -210,6 +236,8 @@ def compute_iterative(
                     prox_g=l0,
                     max_iter=max_iterations,
                     tol=tol,
+                    initial_overshoot=(overshoot and restart != 0),
+                    probe_mask=layer_mask if single_layer else None,
                 )
                 # iterative interventions
                 interventions_r = s * act_diff
@@ -224,10 +252,21 @@ def compute_iterative(
                     pred_indices = pred.softmax(dim=-1)[:, -1, :].argmax(dim=-1)
                     n_corr += (out_indices_true == pred_indices).sum().item()
                 train_accuracy = n_corr / n_samples_task
+                restart_rows.append({
+                    "task": task,
+                    "size": n_neurons,
+                    "restart": restart,
+                    "warm_start": restart == 0,
+                    "train_accuracy": train_accuracy,
+                    "n_iter": len(trace_r),
+                })
                 # keep best run
                 if train_accuracy > best_final_value:
                     best_s, best_trace, best_final_value = s, trace_r, train_accuracy
                     best_iter = restart
+
+            for row in restart_rows[-n_restarts:]:
+                row["selected"] = row["restart"] == best_iter
 
             s, trace, final_value = best_s, best_trace, best_final_value
 
@@ -236,7 +275,8 @@ def compute_iterative(
             path = os.path.join(
                 "iterative",
                 "interventions",
-                "_".join([model.cfg.model_name, task, str(n_neurons)]) + ".pt"
+                "_".join([model.cfg.model_name, task, str(n_neurons)]
+                         + layer_tag + loss_tag) + ".pt"
             )
             torch.save(interventions, path)
 
@@ -247,7 +287,8 @@ def compute_iterative(
             trace_path = os.path.join(
                 "iterative",
                 "trace",
-                "_".join([model.cfg.model_name, task, str(n_neurons)]) + ".json"
+                "_".join([model.cfg.model_name, task, str(n_neurons)]
+                         + layer_tag + loss_tag) + ".json"
             )
             with open(trace_path, "w") as f:
                 json.dump(
@@ -262,20 +303,34 @@ def compute_iterative(
             })
 
         write_taskwise(
-            pd.DataFrame(summary_rows), "results/iterative", "taskwise_summary",
+            pd.DataFrame(summary_rows), "results/iterative",
+            "_".join(["taskwise_summary"] + layer_tag + loss_tag),
+            model.cfg.model_name, task)
+        write_taskwise(
+            pd.DataFrame(restart_rows), "results/iterative",
+            "_".join(["taskwise_restarts"] + layer_tag + loss_tag),
             model.cfg.model_name, task)
 
 def eval_iterative(
-        model_name, 
-        tasks, 
-        n_samples, 
-        batch_size, 
-        sizes, 
-        alpha, 
-        torch_seed, 
-        random_seed):
-    
+        model_name,
+        tasks,
+        n_samples,
+        batch_size,
+        sizes,
+        alpha,
+        torch_seed,
+        random_seed,
+        loss="logit",
+        single_layer=False,
+        overshoot=True):
+
     model, hook_names = load_model(model_name)
+
+    loss_tag = [] if loss == "logit" else [loss]
+    layer_tag = ["single_layer"] if single_layer else []
+    if single_layer:
+        layer_dim = model.cfg.n_heads * model.cfg.d_head
+        sizes = [s for s in sizes if s < layer_dim]
 
     for task in tasks:
 
@@ -287,6 +342,8 @@ def eval_iterative(
         data = no_space_tokens(model, load_task_split(task, "test"))
         n_samples_task = min(len(data), n_samples)
 
+        samples = n_shot_indices(data, n_samples_task, 0)
+
         ####################################################################################
         # evaluate on test set
 
@@ -295,7 +352,8 @@ def eval_iterative(
             path = os.path.join(
                 "iterative",
                 "interventions",
-                "_".join([model.cfg.model_name, task, str(n_neurons)]) + ".pt"
+                "_".join([model.cfg.model_name, task, str(n_neurons)]
+                         + layer_tag + loss_tag) + ".pt"
             )
             interventions = torch.load(path)
             patch_dict = {hook_names[l]: interventions[l] for l in range(model.cfg.n_layers)}
@@ -304,6 +362,7 @@ def eval_iterative(
             # compute accuracy
             accuracy = evaluate_accuracy(
                 model, intervention_fwd, data, n_samples_task, 0, batch_size,
+                samples=samples,
                 mask_dict=mask_dict, patch_dict=patch_dict, scale=1, hook_names=hook_names)
             ci_lower, ci_upper = wilson_ci(accuracy, n_samples_task, alpha)
             rows.append({
@@ -312,7 +371,8 @@ def eval_iterative(
                 "n_samples": n_samples_task, "task": task})
 
         write_taskwise(
-            pd.DataFrame(rows), "results/iterative", "taskwise",
+            pd.DataFrame(rows), "results/iterative",
+            "_".join(["taskwise"] + layer_tag + loss_tag),
             model.cfg.model_name, task)
 
 def eval_first_order(
@@ -485,12 +545,13 @@ def run_intervention_effects(
 
     pd.DataFrame(all_rows).to_csv(os.path.join("results", "interactions", "interactions.csv"))
 
-def prepare_figures(model_name, tasks, sizes):
+def prepare_figures(model_name, tasks, sizes, loss="logit"):
 
     # merge per-(model, task) shards written by the parallel compute jobs into the
     # per-model CSVs that figures.R reads (and that this step itself consumes below)
     combine_taskwise(model_name, tasks)
 
+    loss_tag = [] if loss == "logit" else [loss]
     model_short = model_name.split("/")[-1]
     test_res = pd.read_csv(os.path.join("results", "test", model_short + "_robust.csv"))
     os.makedirs("results/figures/intervention_strength", exist_ok=True)
@@ -535,7 +596,7 @@ def prepare_figures(model_name, tasks, sizes):
                     })
 
             interventions = torch.load(os.path.join("iterative", "interventions",
-                    "_".join([model_short, task, str(size)]) + ".pt"))
+                    "_".join([model_short, task, str(size)] + loss_tag) + ".pt"))
             it_mask       = interventions != 0
 
             total_abs = interventions[it_mask].abs().sum().item()
@@ -560,8 +621,10 @@ def prepare_figures(model_name, tasks, sizes):
                     })
 
     pd.DataFrame(rows).to_csv(
-        os.path.join("results", "figures", "intervention_strength", model_short + ".csv"),
+        os.path.join("results", "figures", "intervention_strength",
+                     "_".join([model_short] + loss_tag) + ".csv"),
         index=False)
     pd.DataFrame(neuron_rows).to_csv(
-        os.path.join("results", "figures", "neurons_per_head", model_short + ".csv"),
+        os.path.join("results", "figures", "neurons_per_head",
+                     "_".join([model_short] + loss_tag) + ".csv"),
         index=False)

@@ -106,6 +106,8 @@ def ZeroFPR(
     max_backtracks: int = 20,
     tol: float = 1e-8,
     verbose: bool = False,
+    initial_overshoot: bool = True,
+    probe_mask: torch.Tensor = None,
 ):
     """
     ZeroFPR algorithm.
@@ -123,6 +125,8 @@ def ZeroFPR(
         max_backtracks: Maximum line search halvings per iteration.
         tol:            Convergence tolerance on ||res||_inf / gamma.
         verbose:        Print progress.
+        initial_overshoot: Take an oversized (1.5*gamma) prox-gradient pre-step.
+        probe_mask:     Optional boolean mask confining the Lipschitz step.
 
     Returns:
         xbar:          Solution (proximal point at final iterate).
@@ -133,15 +137,21 @@ def ZeroFPR(
 
     # --- initialize gamma ---
     # estimate Lipschitz constant via finite difference
-    x_eps = x + 1.0
+    x_eps = x + 1.0 if probe_mask is None else x + probe_mask
     _, grad_eps = f_and_grad(x_eps)
-    Lf_est = torch.linalg.vector_norm(grad_eps - grad_f_x).item() / math.sqrt(x.numel())
+    grad_diff = grad_eps - grad_f_x
+    if probe_mask is not None:
+        grad_diff = grad_diff * probe_mask
+    n_probe = x.numel() if probe_mask is None else int(probe_mask.sum().item())
+    Lf_est = torch.linalg.vector_norm(grad_diff).item() / math.sqrt(n_probe)
     Lf_est = max(Lf_est, 1e-6)
     gamma = alpha / Lf_est
 
     # --- initial gradient step ---
-    x, _ = prox_g(x - 1.5*gamma*grad_f_x, gamma)
-    f_x, grad_f_x = f_and_grad(x)
+    # skipped for the relevance-based warm start (enters the loop from x0 as-is)
+    if initial_overshoot:
+        x, _ = prox_g(x - 1.5*gamma*grad_f_x, gamma)
+        f_x, grad_f_x = f_and_grad(x)
 
     # --- initial forward-backward step ---
     y = x - gamma * grad_f_x
