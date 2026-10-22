@@ -52,12 +52,15 @@ The script `figures.R` can then be used to recreate the figures and tables.
     - default: the 12 tasks we investigated in the paper
 - `--sizes` (multiple integer arguments)
     - list of neuron set sizes you want to compute/evaluate interventions for
-    - default: 2^3 to 2^11
+    - default: 2^0 to 2^8
+- `--add-resid-dim`
+    - append the model's residual stream dimension (d_model) to the sizes
 
 #### Additional arguments
 - `--n-shots`: number of examples for the k-shot setting, defaults to 10
 - `--scales`: hyperparameter sweep for the no_refinement/no_rebustification baselines, defaults to a range of parameters from 0.01 to 50
 - `--alpha`: confidence interval level, default 0.05 (i.e. 95% confidence intervals)
+- `--single-layer`: restrict intervention to a single layer at 1/3 model depth
 
 Sample sizes: number of samples for the baseline/training/test sets, defaults to all available samples if less than the requested are available for a specific task split
 - `--n-baseline`, default=200, number of samples to compute baseline (0-shot, majority class, 10-shot) performance
@@ -74,3 +77,4 @@ Algorithm settings:
 - `--tol`, default=1e-8, convergence tolerance
 - `--n-restarts`, default=10, number of starts
 - `--noise-scale`, default=0.3, amount of noise for random starts
+- `--no-overshoot`, disable initial 1.5*gamma prox-gradient pre-step
